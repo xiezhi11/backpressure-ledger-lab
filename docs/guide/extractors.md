@@ -1,0 +1,506 @@
+---
+id: extractors
+title: 🔬 Extractors
+description: Learn how to use extractors in Fiber middleware
+sidebar_position: 7
+toc_max_heading_level: 4
+---
+
+The extractors package provides shared value extraction utilities for Fiber middleware packages. It helps reduce code duplication across middleware packages while ensuring consistent behavior and security practices.
+
+## Overview
+
+The `github.com/gofiber/fiber/v3/extractors` module provides standardized value extraction utilities integrated into Fiber's middleware ecosystem. This approach:
+
+- **Reduces Code Duplication**: Eliminates redundant extractor implementations across middleware packages
+- **Ensures Consistency**: Maintains identical behavior and security practices across all extractors
+- **Simplifies Maintenance**: Changes to extraction logic only need to be made in one place
+- **Enables Direct Usage**: Middleware can import and use extractors directly
+- **Improves Performance**: Shared, optimized extraction functions reduce overhead
+
+## What Are Extractors?
+
+Extractors are utilities that middleware uses to get values from different parts of HTTP requests:
+
+### Available Extractors
+
+- `FromAuthHeader(authScheme string)`: Extract from Authorization header with optional scheme
+- `FromCookie(key string)`: Extract from HTTP cookies
+- `FromParam(param string)`: Extract from URL path parameters
+- `FromForm(param string)`: Extract from form data
+- `FromHeader(header string)`: Extract from custom HTTP headers
+- `FromQuery(param string)`: Extract from URL query parameters
+- `FromCustom(key string, fn func(fiber.Ctx) (string, error))`: Define custom extraction logic with metadata
+- `Chain(extractors ...Extractor)`: Chain multiple extractors with fallback logic
+- `Resolve(e Extractor, c fiber.Ctx) (Result, error)`: Return the value and which extractor supplied it — `Result.Value`, `Result.Key`, `Result.Source` (preferred for security decisions on chains)
+- `Extractor.Walk(fn func(Extractor) bool)`: Visit this extractor and every nested chained extractor, depth first and in chain order, stopping early when `fn` returns false
+- `Extractor.Contains(pred func(Extractor) bool)`: Check whether this extractor, or any nested chained extractor, matches a predicate
+
+### Extractor Structure
+
+Each `Extractor` contains the fields below (order matches the Go struct). Prefer **keyed** composite literals when constructing `Extractor` values. Source-aware extraction is provided by the package function `Resolve` — it is **not** a field on `Extractor`, so existing unkeyed literals keep compiling.
+
+```go
+type Extractor struct {
+    Extract    func(fiber.Ctx) (string, error) // Extraction callback
+    Key        string                          // Parameter/header name
+    AuthScheme string                          // Auth scheme (FromAuthHeader)
+    Chain      []Extractor                     // Chained extractors (introspection copy)
+    Source     Source                          // Declared/static source metadata
+}
+```
+
+`Resolve` reports provenance as a `Result`, which carries metadata only:
+
+```go
+type Result struct {
+    Value    string // The extracted value
+    Key      string // The parameter/header/cookie name the winning extractor read
+    Source   Source // The kind of source the winning extractor read from
+    Resolved bool   // Whether Key and Source name the extractor that actually produced Value
+}
+```
+
+`Resolved` is false when a chain's own `Extract` answered without any child being
+observed to win. `Key` and `Source` are then the chain's declared metadata (its
+first child) and say nothing about where the value came from, so a security
+decision — such as writing a value back to where it was read from — must refuse
+rather than trust them.
+
+- **Headers**: `Authorization`, `X-API-Key`, custom headers
+- **Cookies**: Session cookies, authentication tokens
+- **Query Parameters**: URL parameters like `?token=abc123`
+- **Form Data**: POST body form fields
+- **URL Parameters**: Route parameters like `/users/:id`
+
+### Source-Aware Extraction
+
+`Extractor.Source` is **declared/static metadata**, not an authoritative origin signal by itself:
+
+- For a chain, static `Source` is the **first** child.
+- `SourceHeader` is the zero value of `Source`. A legacy `Extract`-only callback that omits `Source` therefore reports `SourceHeader` via `Resolve`.
+- Error paths may return static or last-child source metadata even when no value was supplied. Use the returned source for security decisions **only when `err == nil`**, and only when that source metadata is known to be accurate for your extractor.
+
+When middleware needs to know which extractor actually produced the value — to apply a stricter policy, or to write the value back to where it came from — call the package function `Resolve`:
+
+```go
+tokenExtractor := extractors.Chain(
+    extractors.FromHeader("X-API-Key"),
+    extractors.FromQuery("api_key"),
+)
+
+res, err := extractors.Resolve(tokenExtractor, c)
+if err != nil {
+    return err
+}
+token := res.Value
+// res.Source is SourceHeader or SourceQuery depending on which child won — do
+// not assume tokenExtractor.Source (always SourceHeader for this chain).
+// res.Key is the header or query parameter name that child read.
+if res.Source == extractors.SourceQuery {
+    // e.g. apply stricter policy or audit logging for query-sourced secrets
+}
+```
+
+`Resolve` always uses the public `Extract` callback when set (so leaf and chain-level `Extract` overrides for validation/normalization are honored). For a built-in `Chain`, that single `Extract` pass records the winning child and `Resolve` reads the capture — children are not extracted a second time. If `Extract` is fully replaced without delegating to the original (no capture), the declared static metadata is returned rather than re-walking `Chain` children. Leaves return `Extract`'s result with the static metadata. There is no second callback field to clear or re-point.
+
+### Chain Behavior
+
+The `Chain` function creates extractors that try multiple sources in order:
+
+- Returns the first successful extraction (non-empty value with no error)
+- If all extractors fail, returns the last error encountered or `ErrNotFound`
+- **Robust error handling**: Skips children with a `nil` `Extract` (and zero-value trailing children)
+- **Cycle prevention**: Detects recursive chain re-entry and returns `ErrChainCycle` (shared across `Extract` and `Resolve`)
+- Preserves `Source` and `Key` from the first extractor for static metadata (not `AuthScheme`)
+- On success with `Resolved` true, `Resolve` reports the winning child's `Key` and `Source` at runtime
+- On failure, the returned source is fallback metadata only — do not treat it as the origin of an extracted value
+- Exposes a **defensive copy** of children via the `Chain` field for introspection; mutating that slice does not change which children `Extract` runs
+
+### Chain Introspection
+
+Use `Contains` to inspect an extractor tree with a predicate:
+
+```go
+chain := extractors.Chain(
+    extractors.FromHeader("X-CSRF-Token"),
+    extractors.FromCookie("CSRF"),
+)
+
+hasCSRFCookie := chain.Contains(func(e extractors.Extractor) bool {
+    return e.Source == extractors.SourceCookie && e.Key == "CSRF"
+})
+```
+
+## Why Middleware Uses Extractors
+
+Middleware needs to extract values from requests for authentication, authorization, and other purposes. Extractors provide:
+
+- **Security Awareness**: Different sources have different security implications
+- **Fallback Support**: Try multiple sources if the first one doesn't have the value
+- **Consistency**: Same extraction logic across all middleware packages
+- **Source Tracking**: Know where values came from for security decisions
+
+## Usage Examples
+
+### Basic Usage
+
+```go
+// KeyAuth middleware extracts key from header
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromHeader("Middleware-Key"),
+}))
+```
+
+### Fallback Chains
+
+```go
+// Try multiple sources in order
+tokenExtractor := extractors.Chain(
+    extractors.FromHeader("Middleware-Key"),  // Try header first
+    extractors.FromCookie("middleware_key"),  // Then cookie
+    extractors.FromQuery("middleware_key"),   // Finally query param
+)
+
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: tokenExtractor,
+}))
+```
+
+## Configuring Middleware That Uses Extractors
+
+### Authentication Middleware
+
+```go
+// KeyAuth middleware (default: FromAuthHeader)
+app.Use(keyauth.New(keyauth.Config{
+    // Default extracts from Authorization header
+    // Extractor: extractors.FromAuthHeader("Bearer"),
+}))
+
+// Custom header extraction
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromHeader("X-API-Key"),
+}))
+
+// Multiple sources with secure fallback
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.Chain(
+        extractors.FromAuthHeader("Bearer"),  // Secure first
+        extractors.FromHeader("X-API-Key"),   // Then custom header
+        extractors.FromQuery("api_key"),      // Least secure last
+    ),
+}))
+```
+
+### Session Middleware
+
+```go
+// Session middleware (default: FromCookie)
+app.Use(session.New(session.Config{
+    // Default extracts from session_id cookie
+    // Extractor: extractors.FromCookie("session_id"),
+}))
+
+// Custom cookie name
+app.Use(session.New(session.Config{
+    Extractor: extractors.FromCookie("my_session"),
+}))
+```
+
+### CSRF Middleware
+
+```go
+// CSRF middleware (default: FromHeader)
+app.Use(csrf.New(csrf.Config{
+    // Default extracts from X-CSRF-Token header
+    // Extractor: extractors.FromHeader("X-CSRF-Token"),
+}))
+
+// Form-based CSRF (less secure, use only if needed)
+app.Use(csrf.New(csrf.Config{
+    Extractor: extractors.Chain(
+        extractors.FromHeader("X-CSRF-Token"), // Secure first
+        extractors.FromForm("_csrf"),          // Form fallback
+    ),
+}))
+```
+
+## Security Considerations
+
+### Source Characteristics
+
+Different extraction sources have different security properties and use cases:
+
+#### Headers (Generally Preferred)
+
+- **Authorization Header**: Standard for authentication tokens, widely supported
+- **Custom Headers**: Application-specific, less likely to be logged by default
+- **Considerations**: Can be intercepted without HTTPS, may be stripped by proxies
+
+#### Cookies (Good for Sessions)
+
+- **Session Cookies**: Designed for secure client-side storage
+- **Considerations**: Require proper `Secure`, `HttpOnly`, and `SameSite` flags
+- **Best for**: Session management, remember-me tokens
+
+#### Query Parameters (Use Sparingly)
+
+- **Query parameters**: Convenient for simple APIs and debugging
+- **Considerations**: Always visible in URLs, logged by servers/proxies, stored in browser history
+- **Best for**: Non-sensitive parameters, public identifiers
+
+#### Form Data (Context Dependent)
+
+- **POST Bodies**: Suitable for form submissions and API requests
+- **Considerations**: Avoid putting sensitive data in query strings; ensure request bodies aren’t logged and use the correct content type
+- **Best for**: User-generated content, file uploads
+
+### Security Best Practices
+
+1. **Use HTTPS**: Encrypt all traffic to protect extracted values in transit
+2. **Validate Input**: Always validate and sanitize extracted values
+3. **Log Carefully**: Avoid logging sensitive values from any source
+4. **Choose Appropriate Sources**: Match the source to your security requirements
+5. **Test Thoroughly**: Verify extraction works in your environment
+6. **Monitor Security**: Watch for extraction failures or unusual patterns
+
+### Chain Ordering Strategy
+
+When using multiple sources, order them by your security preferences:
+
+```go
+// Example: Prefer headers, fall back to cookies, then query
+extractors.Chain(
+    extractors.FromAuthHeader("Bearer"),    // Standard auth
+    extractors.FromCookie("auth_token"),    // Secure storage
+    extractors.FromQuery("token"),          // Public fallback
+)
+```
+
+The "best" source depends on your specific use case, security requirements, and application architecture.
+
+### Common Security Issues
+
+#### Leaky URLs
+
+```go
+// ❌ DON'T: API keys in URLs (visible in logs, history, bookmarks)
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromQuery("api_key"), // PROBLEMATIC
+}))
+
+// ✅ DO: API keys in headers (not visible in URLs)
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromHeader("X-API-Key"), // BETTER
+}))
+```
+
+#### Session Tokens in Query Parameters
+
+```go
+// ❌ DON'T: Session tokens in URLs (can be bookmarked, leaked)
+app.Use(session.New(session.Config{
+    Extractor: extractors.FromQuery("session"), // PROBLEMATIC
+}))
+
+// ✅ DO: Session tokens in cookies (designed for this purpose)
+app.Use(session.New(session.Config{
+    Extractor: extractors.FromCookie("session_id"), // BETTER
+}))
+```
+
+#### Form-Only CSRF Tokens
+
+While the default extractor uses headers, some implementations use form fields, which is fine if you don't have AJAX or API clients:
+
+```go
+// ❌ DON'T: CSRF tokens only in forms (breaks AJAX, API calls)
+app.Use(csrf.New(csrf.Config{
+    Extractor: extractors.FromForm("_csrf"), // LIMITED
+}))
+
+// ✅ DO: Header-first with form fallback (works everywhere)
+app.Use(csrf.New(csrf.Config{
+    Extractor: extractors.Chain(
+        extractors.FromHeader("X-CSRF-Token"), // PREFERRED
+        extractors.FromForm("_csrf"),          // FALLBACK
+    ),
+}))
+```
+
+### Understanding Trade-offs
+
+**No extractor is universally "secure" - security depends on:**
+
+- Whether you're using HTTPS
+- How you configure cookies (Secure, HttpOnly, SameSite flags)
+- Your logging and monitoring setup
+- The sensitivity of the data being extracted
+- Your threat model and security requirements
+
+Choose extractors based on your specific use case and security needs, not blanket "secure" vs "insecure" labels.
+
+## Standards Compliance
+
+### Authorization Header (RFC 9110 & RFC 7235)
+
+The `FromAuthHeader` extractor provides comprehensive RFC compliance with strict security validation:
+
+#### RFC 9110 Compliance (Authorization Header Format)
+
+- **Section 11.6.2 Format**: Enforces `credentials = auth-scheme 1*SP token68` structure
+- **1*SP Requirement**: Validates exactly one or more spaces between auth-scheme and token
+- **Case-insensitive scheme matching**: `Bearer`, `bearer`, `BEARER` all work correctly
+- **Proper whitespace handling**: Rejects tabs between scheme and token (only spaces allowed)
+
+#### RFC 7235 Token68 Validation
+
+The extractor implements strict token68 character validation per RFC 7235:
+
+- **Allowed characters**: `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`, `+`, `/`, `=`
+- **Padding rules**: `=` characters only allowed at the end of tokens
+- **Security validation**: Prevents tokens starting with `=` or having non-padding characters after `=`
+- **Whitespace rejection**: Rejects tokens containing spaces, tabs, or any other whitespace
+
+#### Security Features
+
+- **Header injection prevention**: Strict parsing prevents malformed authorization headers from bypassing authentication
+- **Token validation**: Ensures extracted tokens conform to standards, preventing authentication bypass
+- **Consistent error handling**: Returns `ErrNotFound` for all invalid cases
+
+#### Examples
+
+```go
+// Standard usage - strict validation
+extractor := extractors.FromAuthHeader("Bearer")
+
+// ✅ Valid cases:
+// "Bearer abc123" -> "abc123"
+// "bearer ABC123" -> "ABC123" (case-insensitive scheme)
+// "Bearer token123=" -> "token123=" (valid padding)
+// "Bearer token==" -> "token==" (valid multiple padding)
+
+// ❌ Invalid cases (all return ErrNotFound):
+// "Bearer abc def" -> rejected (space in token)
+// "Bearer abc\tdef" -> rejected (tab in token)
+// "Bearer =abc" -> rejected (padding at start)
+// "Bearer ab=cd" -> rejected (padding in middle)
+// "Bearer  token" -> rejected (multiple spaces after scheme)
+// "Bearer\ttoken" -> rejected (tab after scheme)
+// "Bearertoken" -> rejected (no space after scheme)
+
+// Raw header extraction (no validation)
+rawExtractor := extractors.FromAuthHeader("")
+// "CustomAuth anything goes here" -> "CustomAuth anything goes here"
+```
+
+#### Benefits
+
+- **Standards Compliance**: Full adherence to HTTP authentication RFCs
+- **Security Hardening**: Prevents common authentication bypass vulnerabilities
+- **Consistent Behavior**: Reliable parsing across different client implementations
+- **Developer Confidence**: Clear validation rules reduce authentication bugs
+
+## Troubleshooting
+
+### Extraction Fails
+
+**Problem**: Middleware returns "value not found" or authentication fails
+
+**Solutions**:
+
+1. Check if the expected header/cookie/query parameter is present
+2. Verify the key name matches exactly (headers are case-insensitive; params/cookies/query keys are case-sensitive)
+3. Ensure the request uses the correct HTTP method (GET vs POST)
+4. Check if middleware is configured with the right extractor
+
+**Debug Example**:
+
+```go
+// Add simple debug logging (avoid logging secrets in production)
+app.Use(func(c fiber.Ctx) error {
+    hdr := c.Get("X-API-Key")
+    cookie := c.Cookies("session_id")
+    if hdr != "" || cookie != "" {
+        log.Printf("debug: X-API-Key present=%t, session_id present=%t", hdr != "", cookie != "")
+    }
+    return c.Next()
+})
+```
+
+### Wrong Source Used
+
+**Problem**: Values extracted from unexpected sources
+
+**Solutions**:
+
+1. Check middleware configuration order
+2. Verify chain order (first successful extraction wins)
+3. Use more specific extractors when needed
+
+### Security Warnings
+
+**Problem**: Getting security warnings in logs
+
+**Solutions**:
+
+1. Switch to more secure sources (headers/cookies)
+2. Use HTTPS to encrypt traffic
+3. Review if sensitive data should be in that source
+
+## Advanced Usage
+
+### Custom Extraction Logic
+
+Extractors support custom extractors for complex scenarios:
+
+```go
+// Extract from custom logic (rarely needed)
+customExtractor := extractors.FromCustom("my-source", func(c fiber.Ctx) (string, error) {
+    // Complex extraction logic
+    if value := c.Locals("computed_token"); value != nil {
+        return value.(string), nil
+    }
+    return "", extractors.ErrNotFound
+})
+```
+
+:::warning
+**Custom extractors break source awareness.** When you use `FromCustom`, middleware cannot determine where the value came from, which means:
+
+- **No automatic security warnings** for potentially insecure sources
+- **No source-based logging** or monitoring capabilities
+- **Developer responsibility** for ensuring the extraction is secure and appropriate
+
+**Only use `FromCustom` when:**
+
+- Standard extractors don't meet your needs
+- You've carefully evaluated the security implications
+- You're confident in the security of your custom extraction logic
+- You understand that middleware cannot provide source-aware security guidance
+
+**Note:** If you pass `nil` as the function parameter, `FromCustom` will return an extractor that always fails with `ErrNotFound`.
+:::
+
+### Multiple Middleware Coordination
+
+When using multiple middleware that extract values, ensure they don't conflict:
+
+```go
+// Good: Different sources for different purposes
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromHeader("X-API-Key"),
+}))
+app.Use(session.New(session.Config{
+    Extractor: extractors.FromCookie("session_id"),
+}))
+
+// Avoid: Same source for different middleware
+app.Use(keyauth.New(keyauth.Config{
+    Extractor: extractors.FromCookie("token"), // API auth
+}))
+app.Use(session.New(session.Config{
+    Extractor: extractors.FromCookie("token"), // Session - CONFLICT!
+}))
+```

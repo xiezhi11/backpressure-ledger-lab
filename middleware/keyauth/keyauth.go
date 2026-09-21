@@ -1,0 +1,155 @@
+package keyauth
+
+import (
+	"errors"
+	"strings"
+	"sync"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/extractors"
+	"github.com/gofiber/fiber/v3/internal/quotedstring"
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/middleware/logger"
+	"github.com/gofiber/utils/v2"
+)
+
+// The contextKey type is unexported to prevent collisions with context keys defined in
+// other packages.
+type contextKey int
+
+// The keys for the values in context
+const (
+	tokenKey contextKey = iota
+)
+
+// ErrMissingOrMalformedAPIKey is returned when the API key is missing or invalid.
+var ErrMissingOrMalformedAPIKey = errors.New("missing or invalid API Key")
+
+var registerLogContextTagsOnce sync.Once
+
+// New creates a new middleware handler
+func New(config ...Config) fiber.Handler {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
+	// Init config
+	cfg := configDefault(config...)
+
+	// Determine the auth schemes from the extractor chain.
+	authSchemes := getAuthSchemes(cfg.Extractor)
+
+	// The challenge value only depends on config, so build it once instead of
+	// re-formatting it on every 401/407 response.
+	challengeValue := cfg.Challenge
+	if len(authSchemes) > 0 {
+		challenges := make([]string, 0, len(authSchemes))
+		for _, scheme := range authSchemes {
+			b := make([]byte, 0, len(scheme)+len(cfg.Realm)+16)
+			b = append(b, scheme...)
+			b = append(b, ` realm="`...)
+			b = append(b, quotedstring.Escape(cfg.Realm)...)
+			b = append(b, '"')
+			if utils.EqualFold(scheme, "Bearer") {
+				if cfg.Error != "" {
+					b = append(b, `, error="`...)
+					b = append(b, quotedstring.Escape(cfg.Error)...)
+					b = append(b, '"')
+					if cfg.ErrorDescription != "" {
+						b = append(b, `, error_description="`...)
+						b = append(b, quotedstring.Escape(cfg.ErrorDescription)...)
+						b = append(b, '"')
+					}
+					if cfg.ErrorURI != "" {
+						b = append(b, `, error_uri="`...)
+						b = append(b, quotedstring.Escape(cfg.ErrorURI)...)
+						b = append(b, '"')
+					}
+					if cfg.Error == ErrorInsufficientScope {
+						b = append(b, `, scope="`...)
+						b = append(b, quotedstring.Escape(cfg.Scope)...)
+						b = append(b, '"')
+					}
+				}
+			}
+			challenges = append(challenges, string(b))
+		}
+		challengeValue = strings.Join(challenges, ", ")
+	}
+
+	// Return middleware handler
+	return func(c fiber.Ctx) error {
+		// Filter request to skip middleware
+		if cfg.Next != nil && cfg.Next(c) {
+			return c.Next()
+		}
+
+		// Extract and verify key
+		key, err := cfg.Extractor.Extract(c)
+		if errors.Is(err, extractors.ErrNotFound) {
+			// Replace shared extractor not found error with a keyauth specific error
+			err = ErrMissingOrMalformedAPIKey
+		}
+		// If there was no error extracting the key, validate it
+		if err == nil {
+			var valid bool
+			valid, err = cfg.Validator(c, key)
+			if err == nil && valid {
+				fiber.StoreInContext(c, tokenKey, key)
+				return cfg.SuccessHandler(c)
+			}
+		}
+
+		// Execute the error handler first
+		handlerErr := cfg.ErrorHandler(c, err)
+
+		status := c.Res().StatusCode()
+		// The ErrorHandler may return the error for the app to write; honor its status code too.
+		var fiberErr *fiber.Error
+		if errors.As(handlerErr, &fiberErr) && fiberErr != nil {
+			status = fiberErr.Code
+		}
+		if status == fiber.StatusUnauthorized || status == fiber.StatusProxyAuthRequired {
+			header := fiber.HeaderWWWAuthenticate
+			if status == fiber.StatusProxyAuthRequired {
+				header = fiber.HeaderProxyAuthenticate
+			}
+			if challengeValue != "" {
+				c.Set(header, challengeValue)
+			}
+		}
+
+		return handlerErr
+	}
+}
+
+func registerLogContextTags() {
+	logger.RegisterContextTag("api-key", func(ctx any) string {
+		return redact.Prefix(TokenFromContext(ctx))
+	})
+}
+
+// TokenFromContext returns the bearer token from the request context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+// It returns an empty string if the token does not exist.
+func TokenFromContext(ctx any) string {
+	if token, ok := fiber.ValueFromContext[string](ctx, tokenKey); ok {
+		return token
+	}
+
+	return ""
+}
+
+// getAuthSchemes inspects an extractor and its chain to find all auth schemes
+// used by FromAuthHeader. It returns a slice of schemes, or an empty slice if
+// none are found.
+func getAuthSchemes(e extractors.Extractor) []string {
+	// Walked through the extractors package so the traversal, and its cycle
+	// guard, live in one place.
+	var schemes []string
+	e.Walk(func(candidate extractors.Extractor) bool {
+		if candidate.Source == extractors.SourceAuthHeader && candidate.AuthScheme != "" {
+			schemes = append(schemes, candidate.AuthScheme)
+		}
+		return true
+	})
+	return schemes
+}

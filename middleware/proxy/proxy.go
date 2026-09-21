@@ -1,0 +1,690 @@
+package proxy
+
+import (
+	"errors"
+	"net"
+	"net/url"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gofiber/utils/v2"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/crosshost"
+
+	"github.com/gofiber/fiber/v3/internal/fieldname"
+	"github.com/gofiber/fiber/v3/internal/headerlookup"
+	"github.com/gofiber/fiber/v3/internal/idnafold"
+	utilsstrings "github.com/gofiber/utils/v2/strings"
+	"github.com/valyala/fasthttp"
+)
+
+// Balancer creates a load balancer among multiple upstream servers
+func Balancer(config ...Config) fiber.Handler {
+	// Set default config
+	cfg := configDefault(config...)
+	policy := resolvePolicy(cfg.SecurityPolicy)
+
+	// Load balanced client
+	lbc := &fasthttp.LBClient{}
+	// Note that Servers, Timeout, WriteBufferSize, ReadBufferSize and TLSConfig
+	// will not be used if the client are set.
+	if cfg.Client == nil {
+		// Set timeout
+		lbc.Timeout = cfg.Timeout
+		// Validate each upstream against the configured policy and build
+		// a HostClient per server.
+		for _, server := range cfg.Servers {
+			u, err := validateUpstreamForBalancer(server, policy)
+			if err != nil {
+				panic(err)
+			}
+
+			client := &fasthttp.HostClient{
+				NoDefaultUserAgentHeader: true,
+				DisablePathNormalizing:   true,
+				Addr:                     u.Host,
+				MaxConns:                 cfg.MaxConnsPerHost,
+
+				ReadBufferSize:  cfg.ReadBufferSize,
+				WriteBufferSize: cfg.WriteBufferSize,
+
+				TLSConfig: secureTLSConfig(cfg.TLSConfig),
+
+				DialDualStack: cfg.DialDualStack,
+
+				MaxResponseBodySize: cfg.MaxResponseBodySize,
+			}
+			if u.Scheme == schemeHTTPS {
+				client.IsTLS = true
+			}
+			// When private targets are disallowed, validate the resolved IP
+			// at dial time so DNS-rebinding cannot swap a public address for
+			// a private one between validation and connection.
+			if !policy.AllowPrivateIPs {
+				client.Dial = newSSRFDialer(cfg.DialDualStack)
+			}
+
+			lbc.Clients = append(lbc.Clients, client)
+		}
+	} else {
+		// Set custom client
+		lbc = cfg.Client
+	}
+
+	// Return new handler
+	return func(c fiber.Ctx) error {
+		// Don't execute middleware if Next returns true
+		if cfg.Next != nil && cfg.Next(c) {
+			return c.Next()
+		}
+
+		// Set request and response
+		req := c.Request()
+		res := c.Response()
+		normalized := headerlookup.Canonical(c)
+
+		if !policy.KeepHopByHopHeaders {
+			if cfg.KeepConnectionHeader {
+				stripHopByHopRequestHeaders(req, normalized, fiber.HeaderConnection)
+			} else {
+				stripHopByHopRequestHeaders(req, normalized)
+			}
+		}
+
+		// Modify request
+		if cfg.ModifyRequest != nil {
+			if err := cfg.ModifyRequest(c); err != nil {
+				return err
+			}
+		}
+
+		if c.App().Config().Immutable {
+			req.SetRequestURIBytes(req.RequestURI())
+		} else {
+			req.SetRequestURI(utils.UnsafeString(req.RequestURI()))
+		}
+
+		// The upstream connection speaks HTTP/1.1: reset a protocol token
+		// inherited from the inbound request (e.g. "HTTP/2" propagated by
+		// the net/http adaptor) so the serialized request line stays valid.
+		req.Header.SetProtocol("HTTP/1.1")
+
+		// Forward request
+		if err := lbc.Do(req, res); err != nil {
+			return err
+		}
+
+		if !policy.KeepHopByHopHeaders {
+			if cfg.KeepConnectionHeader {
+				stripHopByHopResponseHeaders(res, fiber.HeaderConnection)
+			} else {
+				stripHopByHopResponseHeaders(res)
+			}
+		}
+
+		// Modify response
+		if cfg.ModifyResponse != nil {
+			if err := cfg.ModifyResponse(c); err != nil {
+				return err
+			}
+		}
+
+		// Return nil to end proxying if no error
+		return nil
+	}
+}
+
+var defaultClient = &fasthttp.Client{
+	NoDefaultUserAgentHeader: true,
+	DisablePathNormalizing:   true,
+	MaxConnsPerHost:          defaultMaxConnsPerHost,
+}
+
+var client atomic.Pointer[fasthttp.Client]
+
+var (
+	errNilProxyClientOverride = errors.New("proxy: nil client override passed to Do/Forward")
+	errNilGlobalProxyClient   = errors.New("proxy: global client is nil, set a non-nil client with proxy.WithClient")
+)
+
+// guardedConfigureClient composes a client's optional pre-existing
+// ConfigureClient hook with the dial-time SSRF guard. It is installed on a
+// *fasthttp.Client as the bound method value (&guardedConfigureClient{…}).run,
+// which fasthttp calls once per HostClient it creates — so the guard is
+// present before the first dial to each host and covers both the Dial and
+// DialTimeout code paths.
+//
+// The bound method's code pointer is stable across receivers (unlike a
+// closure's), so ensureClientGuarded recognizes an already-guarded client by
+// identity — no package-level map keyed by the client, which would pin the
+// client and its connection pool for the process lifetime. The struct is
+// referenced only from the client's own ConfigureClient field, so it is
+// collected together with the client.
+type guardedConfigureClient struct {
+	// orig is the caller's ConfigureClient hook, or nil. It runs before the
+	// guard so the guard wraps whatever Dial/DialTimeout it finally sets —
+	// running it after would let a hook that assigns hc.Dial overwrite the
+	// guard and reopen the SSRF hole.
+	orig func(hc *fasthttp.HostClient) error
+}
+
+func (g *guardedConfigureClient) run(hc *fasthttp.HostClient) error {
+	if g.orig != nil {
+		if err := g.orig(hc); err != nil {
+			return err
+		}
+	}
+	installHostClientGuard(hc)
+	return nil
+}
+
+// guardHookPtr is the code pointer shared by every guardedConfigureClient.run
+// method value, used to detect whether a client is already guarded.
+var guardHookPtr = reflect.ValueOf((&guardedConfigureClient{}).run).Pointer()
+
+// guardMu serializes the read-modify-write of a client's ConfigureClient in
+// ensureClientGuarded, so a concurrent guarder cannot write the field mid
+// update or observe it half-installed.
+var guardMu sync.Mutex
+
+// ensureClientGuarded installs the SSRF guard on cli via its ConfigureClient
+// hook, exactly once (idempotent: a client already carrying the guard method
+// is left untouched). It composes with any hook the client already has,
+// without retaining a reference to the client. It is invoked at registration
+// for the default client (init) and WithClient clients — before either is
+// used — and on the dispatch path only for a per-call variadic client (the
+// global client is already guarded), so the common no-variadic request path
+// never reaches this lock. A handler built with a fixed variadic client (e.g.
+// Forward(addr, cli)) does take guardMu once per request; that is a deliberate
+// correctness-over-throughput choice (an unlocked fast path would race a
+// first-time writer).
+//
+// Guarantee scope: the default client and WithClient clients are fully
+// protected. A client supplied as a per-call variadic argument is guarded on
+// first use — but a host it had already dialed keeps its cached, pre-hook
+// HostClient, and mutating a client shared with concurrent non-proxy use is
+// inherently racy. For a full guarantee with a custom client, register it
+// via WithClient before first use, or hand the proxy a dedicated client.
+func ensureClientGuarded(cli *fasthttp.Client) {
+	guardMu.Lock()
+	defer guardMu.Unlock()
+
+	existing := cli.ConfigureClient
+	if existing != nil && reflect.ValueOf(existing).Pointer() == guardHookPtr {
+		return // already guarded (directly or composed with a user hook)
+	}
+	cli.ConfigureClient = (&guardedConfigureClient{orig: existing}).run
+}
+
+func init() {
+	ensureClientGuarded(defaultClient)
+	client.Store(defaultClient)
+}
+
+// WithClient sets the global proxy client.
+// This function should be called before Do and Forward — doing so installs
+// the dial-time SSRF guard (via the client's ConfigureClient hook,
+// composing with any hook it already carries) before the client dials any
+// host, so requests dispatched through it re-validate the resolved IP at
+// connect time, matching the default client's behavior.
+func WithClient(cli *fasthttp.Client) {
+	if cli == nil {
+		panic("proxy: WithClient requires a non-nil *fasthttp.Client")
+	}
+
+	ensureClientGuarded(cli)
+	client.Store(cli)
+}
+
+// realIPHeader is the field the proxy overwrites with the peer address Fiber
+// derived, so an upstream reading it sees this hop's view rather than the
+// client's claim.
+const realIPHeader = "X-Real-IP"
+
+// setRealIP replaces every inbound X-Real-IP field line with the peer address
+// Fiber derived. Set alone overwrites the first and leaves the rest, so a client
+// sending it twice kept a value of its own on the wire.
+func setRealIP(c fiber.Ctx) {
+	// Resolve the address before deleting anything: with ProxyHeader set to
+	// "X-Real-IP", c.IP() reads the very header being replaced, and deleting first
+	// handed the upstream an empty value.
+	ip := c.IP()
+	// Add, not Set: nothing is left to replace, and Add says what is meant.
+	// fieldname.Del rather than Del so a differently-spelled line does not
+	// survive beside it.
+	fieldname.Del(&c.Request().Header, realIPHeader, headerlookup.Canonical(c))
+	c.Request().Header.Add(realIPHeader, ip)
+}
+
+// Forward performs the given http request and fills the given http response.
+// This method will return a fiber.Handler
+//
+// SSRF note: Forward validates the upstream host against the active
+// SecurityPolicy up front and, when AllowPrivateIPs is false, re-validates
+// the resolved IP at dial time via the guard installed on the dispatching
+// client, so a rebinding-capable resolver cannot swap a public answer for
+// a private one between validation and connection.
+func Forward(addr string, clients ...*fasthttp.Client) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		setRealIP(c)
+		return Do(c, addr, clients...)
+	}
+}
+
+// Do performs the given http request and fills the given http response.
+// This method can be used within a fiber.Handler
+//
+// SSRF note: the upstream host is validated against the active
+// SecurityPolicy before the request is sent, and when AllowPrivateIPs is
+// false the resolved IP is re-validated at dial time by the guard
+// installed on the dispatching *fasthttp.Client. The connection therefore
+// targets exactly the address that passed the blocklist, so a
+// rebinding-capable resolver cannot slip a private IP past the check.
+//
+// The guard is installed via the client's ConfigureClient hook, which only
+// affects HostClients created after installation. The default client and
+// WithClient clients are guarded before first use; a client supplied as a
+// per-call variadic override is guarded on first use, so a host it had
+// already dialed keeps a cached, pre-guard HostClient. For a full guarantee
+// with a custom client, register it via WithClient (or pass a dedicated,
+// unused client) before first use.
+func Do(c fiber.Ctx, addr string, clients ...*fasthttp.Client) error {
+	return doAction(c, addr, func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, _ *url.URL) error {
+		return cli.Do(req, resp)
+	}, clients...)
+}
+
+// DoRedirects performs the given http request and fills the given http response, following up to maxRedirectsCount redirects.
+// When the redirect count exceeds maxRedirectsCount, ErrTooManyRedirects is returned.
+// This method can be used within a fiber.Handler
+//
+// Each redirect target is re-validated against the active SecurityPolicy.
+// Unless AllowHTTPSDowngrade is enabled, redirects from an HTTPS origin
+// to a plaintext HTTP target are rejected with ErrRedirectDowngrade.
+//
+// SSRF note: every hop's host is validated against the policy, and when
+// AllowPrivateIPs is false each dial is re-validated by the guard on the
+// dispatching client — so per-hop redirects (including cross-host ones)
+// cannot be rebound to a private IP between validation and connection.
+func DoRedirects(c fiber.Ctx, addr string, maxRedirectsCount int, clients ...*fasthttp.Client) error {
+	policy := currentSecurityPolicy()
+	normalized := headerlookup.Canonical(c)
+	return doActionWithPolicy(c, addr, policy, func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, u *url.URL) error {
+		return followRedirects(cli, req, resp, maxRedirectsCount, u, policy, normalized)
+	}, clients...)
+}
+
+// DoDeadline performs the given request and waits for response until the given deadline.
+// This method can be used within a fiber.Handler
+//
+// SSRF note: same protection as Do — up-front host validation plus the
+// dial-time validated-IP guard when AllowPrivateIPs is false.
+func DoDeadline(c fiber.Ctx, addr string, deadline time.Time, clients ...*fasthttp.Client) error {
+	return doAction(c, addr, func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, _ *url.URL) error {
+		return cli.DoDeadline(req, resp, deadline)
+	}, clients...)
+}
+
+// DoTimeout performs the given request and waits for response during the given timeout duration.
+// This method can be used within a fiber.Handler
+//
+// SSRF note: same protection as Do — up-front host validation plus the
+// dial-time validated-IP guard when AllowPrivateIPs is false.
+func DoTimeout(c fiber.Ctx, addr string, timeout time.Duration, clients ...*fasthttp.Client) error {
+	return doAction(c, addr, func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, _ *url.URL) error {
+		return cli.DoTimeout(req, resp, timeout)
+	}, clients...)
+}
+
+// doActionFunc is the per-method callback driven by doActionWithPolicy.
+// Receivers are handed the validated *url.URL alongside the request so
+// they can avoid re-parsing or re-validating the upstream addr.
+type doActionFunc func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, u *url.URL) error
+
+func doAction(
+	c fiber.Ctx,
+	addr string,
+	action doActionFunc,
+	clients ...*fasthttp.Client,
+) error {
+	return doActionWithPolicy(c, addr, currentSecurityPolicy(), action, clients...)
+}
+
+func doActionWithPolicy(
+	c fiber.Ctx,
+	addr string,
+	policy SecurityPolicy,
+	action doActionFunc,
+	clients ...*fasthttp.Client,
+) error {
+	globalClient := client.Load()
+
+	cli, err := selectClient(globalClient, clients...)
+	if err != nil {
+		return err
+	}
+
+	// The global client (default or WithClient) is guarded at registration,
+	// so only a per-call variadic override needs guarding here. Skipping the
+	// global client keeps the common request path free of the guard lock.
+	// The guard re-validates the resolved IP at dial time; the
+	// validateUpstream call below is only the up-front host check.
+	if len(clients) != 0 {
+		ensureClientGuarded(cli)
+	}
+
+	// Clone addr once at the parse boundary instead of cloning u.Scheme
+	// and u.String() individually after the fact. url.Parse fills u's
+	// field slices (Scheme/Host/Path/...) with substrings of the input,
+	// so if addr is itself a slice of the request buffer (e.g. a caller
+	// derived it from c.OriginalURL()), every field in u aliases the
+	// same backing array — and SetRequestURI below will overwrite it
+	// mid-request. Decoupling u from the request buffer with one clone
+	// here covers SetRequestURI/SetSchemeBytes and also the action
+	// callback in followRedirects, which inspects u.Host after the
+	// SetRequestURI write.
+	addrCopy := strings.Clone(addr)
+	u, err := validateUpstream(addrCopy, policy)
+	if err != nil {
+		return err
+	}
+
+	req := c.Request()
+	res := c.Response()
+	normalized := headerlookup.Canonical(c)
+	originalURL := utils.CopyString(c.OriginalURL())
+	// fasthttp rewrote the Host header to the upstream's; put the client's back for later middleware.
+	originalHost := utils.CopyBytes(req.Header.Host())
+	defer func() {
+		req.SetRequestURI(originalURL)
+		req.Header.SetHostBytes(originalHost)
+	}()
+
+	req.SetRequestURI(u.String())
+	// SetScheme takes the string directly (fasthttp appends its bytes),
+	// avoiding the per-request []byte(u.Scheme) allocation. Re-applying
+	// the scheme is required because SetRequestURI keeps the previous
+	// scheme when req.isTLS is set — see
+	// https://github.com/gofiber/fiber/issues/1762.
+	req.URI().SetScheme(u.Scheme)
+
+	if !policy.KeepHopByHopHeaders {
+		stripHopByHopRequestHeaders(req, normalized)
+	}
+	// The upstream connection speaks HTTP/1.1: reset a protocol token
+	// inherited from the inbound request (e.g. "HTTP/2" propagated by the
+	// net/http adaptor) so the serialized request line stays valid.
+	req.Header.SetProtocol("HTTP/1.1")
+	if err := action(cli, req, res, u); err != nil {
+		return err
+	}
+	if !policy.KeepHopByHopHeaders {
+		stripHopByHopResponseHeaders(res)
+	}
+	return nil
+}
+
+// followRedirects implements a redirect loop that re-validates each
+// target against policy before issuing the next request. It replaces
+// fasthttp.Client.DoRedirects so we can reject HTTPS→HTTP downgrades and
+// reapply SSRF checks to caller-controlled Location headers.
+//
+// initialURL is the validated *url.URL produced by doActionWithPolicy's
+// validateUpstream call. Passing it in lets the loop skip a redundant
+// re-validation (one url.Parse + one DNS lookup) on entry while still
+// guaranteeing every SetRequestURI is fed a string from a
+// validateUpstream output — the property CodeQL's go/request-forgery
+// query needs to see.
+func followRedirects(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int, initialURL *url.URL, policy SecurityPolicy, normalized bool) error { //nolint:revive // flag-parameter: normalized is a property of the header store
+	if maxRedirects < 0 {
+		maxRedirects = 0
+	}
+	currentURL := initialURL
+	currentHost := currentURL.Host
+	for redirects := 0; ; redirects++ {
+		// Rendered once per hop: SetRequestURI copies the bytes and
+		// resolveRedirect below needs the same string, so sharing it saves
+		// a URL.String() allocation on every redirect.
+		currentURLStr := currentURL.String()
+		req.SetRequestURI(currentURLStr)
+		// Re-apply the scheme each hop: SetRequestURI keeps the previous
+		// scheme when req.isTLS is set, so a redirect that changes scheme
+		// (HTTP→HTTPS upgrade, or HTTPS→HTTP when AllowHTTPSDowngrade is
+		// enabled) would otherwise be dispatched with the wrong scheme.
+		// See https://github.com/gofiber/fiber/issues/1762.
+		req.URI().SetScheme(currentURL.Scheme)
+		if err := cli.Do(req, resp); err != nil {
+			return err
+		}
+		status := resp.Header.StatusCode()
+		if !fasthttp.StatusCodeIsRedirect(status) {
+			return nil
+		}
+		if redirects >= maxRedirects {
+			return fasthttp.ErrTooManyRedirects
+		}
+		location := resp.Header.Peek(fiber.HeaderLocation)
+		if len(location) == 0 {
+			return fasthttp.ErrMissingLocation
+		}
+		nextURL, err := resolveRedirect(currentURLStr, location, policy)
+		if err != nil {
+			return err
+		}
+		// POST→GET on 301/302/303 mirrors browser and fasthttp behavior.
+		if req.Header.IsPost() && (status == fasthttp.StatusMovedPermanently || status == fasthttp.StatusFound || status == fasthttp.StatusSeeOther) {
+			req.Header.SetMethod(fasthttp.MethodGet)
+			req.SetBody(nil)
+			req.Header.Del(fasthttp.HeaderContentType)
+			req.Header.Del(fasthttp.HeaderContentLength)
+		}
+		// Strip credentials when the redirect crosses to a different host so
+		// secrets bound to the original origin are not leaked to a third
+		// party (RFC 9110 §15.4 advisory; matches browser behavior).
+		if !utils.EqualFold(nextURL.Host, currentHost) {
+			stripCrossHostHeaders(req, normalized)
+			currentHost = nextURL.Host
+		}
+		currentURL = nextURL
+	}
+}
+
+func stripCrossHostHeaders(req *fasthttp.Request, normalized bool) { //nolint:revive // flag-parameter: normalized is a property of the header store
+	for _, h := range crosshost.SensitiveHeaders {
+		fieldname.Del(&req.Header, h, normalized)
+	}
+}
+
+// containsCTLOrDEL reports whether b holds a control byte that must not appear
+// in a redirect Location value: anything < 0x20 (including HTAB) or DEL. Bytes
+// >= 0x80 never match; they are handled by URI parsing, not header-injection
+// checks. That is exactly utils.IndexControl's set, and its two-words-per-branch
+// scan beats the single-word loop this replaced.
+func containsCTLOrDEL(b []byte) bool {
+	return utils.IndexControl(b) != -1
+}
+
+// resolveRedirect parses a redirect target relative to the current URL
+// and applies the SecurityPolicy. CRLF and other control bytes are
+// rejected to prevent header injection via Location. The returned value
+// is the validated *url.URL produced by validateUpstream, so callers
+// pass it straight into network sinks without re-parsing user-controlled
+// strings.
+func resolveRedirect(currentURL string, location []byte, policy SecurityPolicy) (*url.URL, error) {
+	if containsCTLOrDEL(location) {
+		return nil, fasthttp.ErrorInvalidURI
+	}
+	uri := fasthttp.AcquireURI()
+	defer fasthttp.ReleaseURI(uri)
+	uri.Update(currentURL)
+	// previousScheme is at most "https" (5 bytes). A stack-sized scratch
+	// buffer holds it without escaping to the heap, eliminating the
+	// per-hop allocation that the previous append([]byte(nil), ...)
+	// pattern produced.
+	var schemeBuf [8]byte
+	previousScheme := append(schemeBuf[:0], uri.Scheme()...)
+	uri.UpdateBytes(location)
+	if len(uri.Host()) == 0 {
+		return nil, fasthttp.ErrorInvalidURI
+	}
+	target, err := validateUpstream(uri.String(), policy)
+	if err != nil {
+		return nil, err
+	}
+	if !policy.AllowHTTPSDowngrade && utils.EqualFold(previousScheme, httpsSchemeBytes) && target.Scheme == schemeHTTP {
+		return nil, ErrRedirectDowngrade
+	}
+	return target, nil
+}
+
+func selectClient(globalClient *fasthttp.Client, clients ...*fasthttp.Client) (*fasthttp.Client, error) {
+	if len(clients) != 0 {
+		if clients[0] == nil {
+			return nil, errNilProxyClientOverride
+		}
+
+		return clients[0], nil
+	}
+
+	if globalClient == nil {
+		return nil, errNilGlobalProxyClient
+	}
+
+	return globalClient, nil
+}
+
+// DomainForward performs an http request based on the given domain and populates the given http response.
+// This method will return a fiber.Handler.
+//
+// The upstream addr is validated at handler construction: scheme allowlist,
+// SSRF block, and URL parsing all run once. Unlike Balancer (which defers
+// DNS to dial time to survive transient resolver failures at startup), this
+// construction check resolves the host, so a misconfigured or unresolvable
+// addr panics at startup instead of failing per request. Each request also
+// re-validates the host against the current policy before dispatch.
+//
+// SSRF note: the per-request validation is an up-front host check, and
+// when AllowPrivateIPs is false the dispatching client's dial-time guard
+// re-validates the resolved IP at connect time — so a rebinding-capable
+// resolver cannot reach a private address through this handler.
+
+// foldHostnameLabel returns hostname with its host label folded to lowercase
+// Punycode, preserving an explicit port unchanged. It is the construction-time
+// counterpart to hostWithoutPort: that strips a port from the per-request wire
+// value, this normalizes the configured value once so the two sides compare
+// correctly regardless of how the operator spelled the domain.
+func foldHostnameLabel(hostname string) string {
+	if host, port, ok := utils.SplitHostPort(hostname); ok {
+		return net.JoinHostPort(idnafold.ToASCII(utilsstrings.ToLower(host)), port)
+	}
+	return idnafold.ToASCII(utilsstrings.ToLower(hostname))
+}
+
+// hostWithoutPort strips the port from a Host header value, keeping a bracketed IPv6 literal.
+func hostWithoutPort(host string) string {
+	if strings.HasPrefix(host, "[") {
+		if end := strings.IndexByte(host, ']'); end != -1 {
+			return host[:end+1]
+		}
+		return host
+	}
+	if i := strings.LastIndexByte(host, ':'); i != -1 && strings.IndexByte(host[:i], ':') == -1 {
+		return host[:i]
+	}
+	return host
+}
+
+func DomainForward(hostname, addr string, clients ...*fasthttp.Client) fiber.Handler {
+	base, err := validateUpstream(addr, currentSecurityPolicy())
+	if err != nil {
+		panic(err)
+	}
+	// A Unicode hostname literal — entirely natural to write for a non-ASCII
+	// domain — never appears on the wire: a conforming client always sends
+	// the Punycode form (RFC 5891), so folding once here, rather than on
+	// every request, is what makes the two sides comparable at all.
+	hostname = foldHostnameLabel(hostname)
+	return func(c fiber.Ctx) error {
+		// Host names are case-insensitive (RFC 9110 §4.2.3) and fasthttp
+		// does not case-fold the raw Host header, so compare with
+		// EqualFold — otherwise "API.Example.com" would slip past a
+		// DomainForward("api.example.com", ...) gate and be passed
+		// through unproxied.
+		// Match the host with or without its port; another host is passed on to the next handler.
+		host := utils.UnsafeString(c.Request().Host())
+		if !utils.EqualFold(host, hostname) && !utils.EqualFold(hostWithoutPort(host), hostname) {
+			return c.Next()
+		}
+		setRealIP(c)
+		return doActionWithPolicy(c, joinUpstreamPath(base, c.OriginalURL()), currentSecurityPolicy(),
+			func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, _ *url.URL) error {
+				return cli.Do(req, resp)
+			}, clients...)
+	}
+}
+
+// urlRoundrobin is the *url.URL-typed equivalent of the legacy
+// string-based round-robin. Storing parsed URLs lets BalancerForward
+// skip per-request url.Parse on its configured upstream list.
+type urlRoundrobin struct {
+	pool []*url.URL
+
+	next atomic.Uint64
+}
+
+// Compare-and-swap rather than a bare Add, so the counter holds the next index
+// already reduced into the pool and the sequence stays a strict round-robin
+// across a wrap. The modulo also reduces a counter this loop did not produce.
+func (r *urlRoundrobin) get() *url.URL {
+	poolSize := uint64(len(r.pool))
+	for {
+		next := r.next.Load()
+		index := next % poolSize
+		following := index + 1
+		if following == poolSize {
+			following = 0
+		}
+		if r.next.CompareAndSwap(next, following) {
+			return r.pool[index]
+		}
+	}
+}
+
+// BalancerForward Forward performs the given http request with round robin algorithm to server and fills the given http response.
+// This method will return a fiber.Handler.
+//
+// As with DomainForward, every server is parsed and policy-checked at
+// handler construction. A misconfigured entry panics at startup.
+//
+// SSRF note: despite the name, this helper dispatches through the
+// shared/user-supplied client rather than a Balancer HostClient, but it
+// gets the same protection as Do — up-front host validation plus the
+// dial-time validated-IP guard on the dispatching client when
+// AllowPrivateIPs is false.
+func BalancerForward(servers []string, clients ...*fasthttp.Client) fiber.Handler {
+	if len(servers) == 0 {
+		panic("Servers cannot be empty")
+	}
+	policy := currentSecurityPolicy()
+	bases := make([]*url.URL, len(servers))
+	for i, s := range servers {
+		base, err := validateUpstream(s, policy)
+		if err != nil {
+			panic(err)
+		}
+		bases[i] = base
+	}
+	r := &urlRoundrobin{pool: bases}
+	return func(c fiber.Ctx) error {
+		base := r.get()
+		setRealIP(c)
+		return doActionWithPolicy(c, joinUpstreamPath(base, c.OriginalURL()), currentSecurityPolicy(),
+			func(cli *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, _ *url.URL) error {
+				return cli.Do(req, resp)
+			}, clients...)
+	}
+}
